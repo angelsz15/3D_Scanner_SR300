@@ -2,63 +2,56 @@ import pyrealsense2 as rs
 import numpy as np
 import cv2
 import open3d as o3d
+import copy
 import time
 import os
 
-def align_and_merge_tsdf(rgbd_images, intrinsic):
-    if len(rgbd_images) == 0:
+def align_and_merge(scans):
+    if len(scans) == 0:
         return None
+    if len(scans) == 1:
+        return scans[0]
         
-    print(f"\n[+] Iniciando motor de alta precisión TSDF con {len(rgbd_images)} fotogramas...")
+    print(f"\nProcesando el video 3D... Uniendo {len(scans)} fotogramas capturados...")
     
-    # Volumen TSDF: Integra matemáticamente el ruido y genera una sola superficie pulida.
-    # voxel_length = 2mm de precisión, sdf_trunc = tolerancia 1cm.
-    volume = o3d.pipelines.integration.ScalableTSDFVolume(
-        voxel_length=0.002,
-        sdf_trunc=0.01,
-        color_type=o3d.pipelines.integration.TSDFVolumeColorType.RGB8)
+    merged_pcd = o3d.geometry.PointCloud()
+    merged_pcd += scans[0]
+    
+    current_transform = np.identity(4)
+    
+    for i in range(1, len(scans)):
+        source = scans[i]
+        target = scans[i-1]
         
-    # El primer fotograma es nuestro punto de origen 0,0,0
-    current_pose = np.identity(4)
-    volume.integrate(rgbd_images[0], intrinsic, current_pose)
-    
-    # Odometría Híbrida: usa profundidad + color para tracking (previene que el tracking resbale)
-    odo_criteria = o3d.pipelines.odometry.OdometryOption()
-    
-    successful_frames = 1
-    
-    for i in range(1, len(rgbd_images)):
-        source = rgbd_images[i]
-        target = rgbd_images[i-1]
+        if i % 5 == 0:
+            print(f"  Alineando fotograma {i}/{len(scans)}...")
+            
+        source.estimate_normals(o3d.geometry.KDTreeSearchParamHybrid(radius=0.03, max_nn=30))
+        target.estimate_normals(o3d.geometry.KDTreeSearchParamHybrid(radius=0.03, max_nn=30))
         
-        # Calcular cuánto se movió la cámara usando Odometría RGBD
-        success, trans, info = o3d.pipelines.odometry.compute_rgbd_odometry(
-            source, target, intrinsic, np.identity(4),
-            o3d.pipelines.odometry.RGBDOdometryJacobianFromHybridTerm(),
-            odo_criteria)
-            
-        if success:
-            # Multiplicamos la pose actual por el cambio (trans)
-            # odo_trans mapea source -> target, por ende pose_actual = trans * pose_anterior
-            current_pose = np.dot(current_pose, trans)
-            
-            # Integramos matemáticamente los píxeles al grid volumétrico 3D usando su pose exacta
-            # Esto elimina las "capas dobles" y promedia el ruido de las mallas
-            volume.integrate(source, intrinsic, np.linalg.inv(current_pose))
-            
-            successful_frames += 1
-            if i % 10 == 0:
-                print(f"  [Odometría] Fotograma {i}/{len(rgbd_images)} alineado e integrado con precisión.")
-        else:
-            print(f"  [Aviso] Pérdida de Odometría en fotograma {i}. Ignorando frame.")
+        # Tolerancia muy baja porque es video contínuo (los frames están muy pegados)
+        threshold = 0.05
+        init_trans = np.identity(4)
+        
+        result_icp = o3d.pipelines.registration.registration_colored_icp(
+            source, target, threshold, init_trans,
+            o3d.pipelines.registration.TransformationEstimationForColoredICP(),
+            o3d.pipelines.registration.ICPConvergenceCriteria(relative_fitness=1e-6,
+                                                              relative_rmse=1e-6,
+                                                              max_iteration=50) # Menos iteraciones porque está muy cerca
+        )
+        
+        current_transform = current_transform @ result_icp.transformation
+        
+        source_aligned = copy.deepcopy(source)
+        source_aligned.transform(current_transform)
+        merged_pcd += source_aligned
 
-    print(f"\n[+] Extrayendo malla 3D continua de {successful_frames} fotogramas útiles...")
+    print("\n¡Grabación unida! Filtrando rebabas y reduciendo ruido (Voxel Downsample)...")
+    merged_pcd = merged_pcd.voxel_down_sample(voxel_size=0.002)
+    merged_pcd, ind = merged_pcd.remove_statistical_outlier(nb_neighbors=30, std_ratio=1.5)
     
-    # Extraer Mesh Continua Triangulada
-    mesh = volume.extract_triangle_mesh()
-    mesh.compute_vertex_normals()
-    
-    return mesh
+    return merged_pcd
 
 def main():
     print("Iniciando conexión con la cámara RealSense SR300...")
@@ -85,21 +78,21 @@ def main():
     align_to = rs.stream.color
     align = rs.align(align_to)
 
-    raw_frames = []
+    scans = []
     os.makedirs("escaneos", exist_ok=True)
 
     print("\n================ TUS CONTROLES ==================")
-    print("1. Enpunta al objeto de cerca (aislado del fondo principal).")
+    print("1. Enpunta al objeto de cerca (aislado).")
     print("2. Presiona 'R' para EMPEZAR A GRABAR en 3D.")
-    print("3. Muévete LENTO Y CONSTANTE alrededor del objeto.")
-    print("4. Vuelve a presionar 'R' para PARAR Y FUSIONAR.")
+    print("3. Muévete muy lentamente alrededor del objeto.")
+    print("4. Vuelve a presionar 'R' para PARAR Y CONSTRUIR.")
     print("5. Presiona 'Q' o 'ESC' para SALIR.")
     print("=================================================\n")
 
     is_recording = False
     record_timer = 0
-    # Guardamos 1 de cada 4 fotogramas para tener superposiciones ricas en detalles pero procesar rápido 
-    record_interval = 4 
+    # Guardaremos 1 de cada 5 frames visuales (~6 fotogramas por segundo) para no colapsar la RAM
+    record_interval = 5 
 
     try:
         while True:
@@ -118,29 +111,33 @@ def main():
             display_color = color_image.copy()
             depth_colormap = cv2.applyColorMap(cv2.convertScaleAbs(depth_image, alpha=0.03), cv2.COLORMAP_JET)
             
-            # ---- OBTENER PARÁMETROS INTRÍNSECOS DE CÁMARA (Lente) ----
-            intrinsics = profile.get_stream(rs.stream.color).as_video_stream_profile().get_intrinsics()
-            pinhole_intrinsic = o3d.camera.PinholeCameraIntrinsic(
-                intrinsics.width, intrinsics.height, intrinsics.fx, intrinsics.fy, intrinsics.ppx, intrinsics.ppy)
-
-            # Lógica de Captura 
+            # Lógica de Captura Continua
             if is_recording:
                 record_timer += 1
                 if record_timer >= record_interval:
                     record_timer = 0
                     
-                    depth_trunc = 0.6  # Recorte de fondo para mejor odometría
-                    
+                    depth_trunc = 0.6 # Ignorar fondo lejano
                     depth_o3d = o3d.geometry.Image(depth_image)
                     color_o3d = o3d.geometry.Image(cv2.cvtColor(color_image, cv2.COLOR_BGR2RGB))
                     
-                    rgbd = o3d.geometry.RGBDImage.create_from_color_and_depth(
+                    intrinsics = profile.get_stream(rs.stream.color).as_video_stream_profile().get_intrinsics()
+                    pinhole_camera_intrinsic = o3d.camera.PinholeCameraIntrinsic(
+                        intrinsics.width, intrinsics.height, intrinsics.fx, intrinsics.fy, intrinsics.ppx, intrinsics.ppy)
+
+                    rgbd_image = o3d.geometry.RGBDImage.create_from_color_and_depth(
                         color_o3d, depth_o3d, depth_scale=1.0/depth_scale, depth_trunc=depth_trunc, convert_rgb_to_intensity=False)
                     
-                    raw_frames.append(rgbd)
+                    pcd = o3d.geometry.PointCloud.create_from_rgbd_image(rgbd_image, pinhole_camera_intrinsic)
+                    pcd.transform([[1, 0, 0, 0], [0, -1, 0, 0], [0, 0, -1, 0], [0, 0, 0, 1]])
+                    
+                    # Filtro ultra rápido
+                    pcd = pcd.voxel_down_sample(voxel_size=0.005)
+                    
+                    scans.append(pcd)
 
-            # --- HUD VISUAL ---
-            cv2.putText(display_color, f"Frames Grabados: {len(raw_frames)}", (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
+            # Textos en pantalla
+            cv2.putText(display_color, f"Fotogramas 3D: {len(scans)}", (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
             cv2.putText(display_color, "R: Grabar | Q: Salir", (10, 60), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 255), 2)
             
             if is_recording:
@@ -148,7 +145,7 @@ def main():
                 cv2.putText(display_color, "GRABANDO...", (50, 100), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 0, 255), 2)
 
             images = np.hstack((display_color, depth_colormap))
-            cv2.imshow('Scanner 3D TSDF - SR300', images)
+            cv2.imshow('Scanner 3D CONTINUO - SR300', images)
             
             key = cv2.waitKey(1)
             
@@ -156,38 +153,32 @@ def main():
                 break
                 
             elif key & 0xFF == ord('r'):
-                # Parar y Reconstruir
+                # Si estaba grabando, detener y fusionar
                 if is_recording:
                     is_recording = False
-                    print(f"\n[!] Grabación detenida. Total frames: {len(raw_frames)}.")
+                    print(f"\n[!] Grabación detenida. Total de fotogramas 3D en la cinta: {len(scans)}.")
                     
-                    if len(raw_frames) < 3:
-                        print("Muy pocos fotogramas. Graba durante al menos un par de segundos.")
-                        raw_frames = []
+                    if len(scans) < 2:
+                        print("Muy pocos fotogramas para unir. Moviéndonos y graba más rato.")
+                        scans = []
                         continue
                         
-                    # LLAMADA AL MOTOR TSDF
-                    merged_mesh = align_and_merge_tsdf(raw_frames, pinhole_intrinsic)
+                    merged_result = align_and_merge(scans)
                     
-                    if merged_mesh is not None:
-                        # Invertir 180 grads en Y y Z para visualización correcta (Open3D vs Sensor)
-                        merged_mesh.transform([[1, 0, 0, 0], [0, -1, 0, 0], [0, 0, -1, 0], [0, 0, 0, 1]])
-                        
-                        filename = os.path.join("escaneos", f"supermesh_{int(time.time())}.ply")
-                        o3d.io.write_triangle_mesh(filename, merged_mesh)
-                        print(f"\n¡Éxito Absoluto! Malla de alta definición guardada en: {filename}")
-                        
-                        print("Cierra el visor 3D para continuar...")
-                        o3d.visualization.draw_geometries([merged_mesh], window_name="Malla Volumétrica TSDF Alta Precisión")
+                    filename = os.path.join("escaneos", f"video_mesh_{int(time.time())}.ply")
+                    o3d.io.write_point_cloud(filename, merged_result)
+                    print(f"\n¡Éxito! Grabación 3D unida y guardada en: {filename}")
                     
-                    raw_frames = [] # Reset
+                    print("Cierra el visor 3D para continuar...")
+                    o3d.visualization.draw_geometries([merged_result], window_name="Malla Grabada")
+                    
+                    scans = [] # Reiniciar cinta
                     record_timer = 0
-                else:
-                    # Comenzar a grabar
+                else: # Empezar a grabar
                     is_recording = True
-                    raw_frames = []
+                    scans = []
                     record_timer = 0
-                    print("\n[REC] Empezando Captura Volumétrica... Muévete estable y con suavidad.")
+                    print("\n[REC] ¡Grabando en 3D! Mueve la cámara lentamente...")
 
     finally:
         pipeline.stop()
