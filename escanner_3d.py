@@ -5,6 +5,7 @@ import open3d as o3d
 import copy
 import time
 import os
+from imu_reader import IMUReader
 
 def align_and_merge(scans):
     if len(scans) == 0:
@@ -15,13 +16,13 @@ def align_and_merge(scans):
     print(f"\nProcesando el video 3D... Uniendo {len(scans)} fotogramas capturados...")
     
     merged_pcd = o3d.geometry.PointCloud()
-    merged_pcd += scans[0]
+    merged_pcd += scans[0]['pcd']
     
     current_transform = np.identity(4)
     
     for i in range(1, len(scans)):
-        source = scans[i]
-        target = scans[i-1]
+        source = scans[i]['pcd']
+        target = scans[i-1]['pcd']
         
         if i % 5 == 0:
             print(f"  Alineando fotograma {i}/{len(scans)}...")
@@ -31,7 +32,17 @@ def align_and_merge(scans):
         
         # Tolerancia muy baja porque es video contínuo (los frames están muy pegados)
         threshold = 0.05
+        
+        # Pre-alineación basada en la IMU para Yaw (eje de rotación)
+        # Asumiendo que el giro del escáner ocurre predominantemente horizontal (Y)
+        delta_yaw_deg = scans[i-1]['yaw'] - scans[i]['yaw']
+        delta_yaw_rad = np.radians(delta_yaw_deg)
+        
         init_trans = np.identity(4)
+        init_trans[0, 0] = np.cos(delta_yaw_rad)
+        init_trans[0, 2] = np.sin(delta_yaw_rad)
+        init_trans[2, 0] = -np.sin(delta_yaw_rad)
+        init_trans[2, 2] = np.cos(delta_yaw_rad)
         
         result_icp = o3d.pipelines.registration.registration_colored_icp(
             source, target, threshold, init_trans,
@@ -78,15 +89,19 @@ def main():
     align_to = rs.stream.color
     align = rs.align(align_to)
 
+    imu = IMUReader(baudrate=115200)
+    imu.start()
+
     scans = []
     os.makedirs("escaneos", exist_ok=True)
 
     print("\n================ TUS CONTROLES ==================")
     print("1. Enpunta al objeto de cerca (aislado).")
-    print("2. Presiona 'R' para EMPEZAR A GRABAR en 3D.")
-    print("3. Muévete muy lentamente alrededor del objeto.")
-    print("4. Vuelve a presionar 'R' para PARAR Y CONSTRUIR.")
-    print("5. Presiona 'Q' o 'ESC' para SALIR.")
+    print("2. Presiona 'C' para CALIBRAR EL IMU.")
+    print("3. Presiona 'R' para EMPEZAR A GRABAR en 3D.")
+    print("4. Muévete muy lentamente alrededor del objeto.")
+    print("5. Vuelve a presionar 'R' para PARAR Y CONSTRUIR.")
+    print("6. Presiona 'Q' o 'ESC' para SALIR.")
     print("=================================================\n")
 
     is_recording = False
@@ -134,15 +149,21 @@ def main():
                     # Filtro ultra rápido
                     pcd = pcd.voxel_down_sample(voxel_size=0.005)
                     
-                    scans.append(pcd)
+                    # Guardamos la pose junto al PointCloud
+                    imu_yaw, imu_pitch, imu_roll = imu.get_pose()
+                    scans.append({'pcd': pcd, 'yaw': imu_yaw})
 
             # Textos en pantalla
             cv2.putText(display_color, f"Fotogramas 3D: {len(scans)}", (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
-            cv2.putText(display_color, "R: Grabar | Q: Salir", (10, 60), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 255), 2)
+            
+            # IMU UI
+            imu_yaw, imu_pitch, imu_roll = imu.get_pose()
+            cv2.putText(display_color, f"IMU: Y:{imu_yaw:.1f} P:{imu_pitch:.1f} R:{imu_roll:.1f}", (10, 60), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 0), 2)
+            cv2.putText(display_color, "R: Grabar | C: Calibrar IMU | Q: Salir", (10, 90), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 255), 2)
             
             if is_recording:
-                cv2.circle(display_color, (30, 95), 10, (0, 0, 255), -1)
-                cv2.putText(display_color, "GRABANDO...", (50, 100), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 0, 255), 2)
+                cv2.circle(display_color, (30, 125), 10, (0, 0, 255), -1)
+                cv2.putText(display_color, "GRABANDO...", (50, 130), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 0, 255), 2)
 
             images = np.hstack((display_color, depth_colormap))
             cv2.imshow('Scanner 3D CONTINUO - SR300', images)
@@ -151,6 +172,10 @@ def main():
             
             if key & 0xFF == ord('q') or key == 27:
                 break
+                
+            elif key & 0xFF == ord('c'):
+                print("\n[!] Solicitando calibración del IMU...")
+                imu.send_command('c')
                 
             elif key & 0xFF == ord('r'):
                 # Si estaba grabando, detener y fusionar
@@ -181,6 +206,7 @@ def main():
                     print("\n[REC] ¡Grabando en 3D! Mueve la cámara lentamente...")
 
     finally:
+        imu.stop()
         pipeline.stop()
         cv2.destroyAllWindows()
 
