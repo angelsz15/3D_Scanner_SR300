@@ -58,10 +58,25 @@ def align_and_merge(scans):
         source_aligned.transform(current_transform)
         merged_pcd += source_aligned
 
-    print("\n¡Grabación unida! Filtrando rebabas y reduciendo ruido (Voxel Downsample)...")
+    print("\n¡Grabación unida! Limpiando nube de puntos en múltiples fases...")
+
+    # Fase 1: Voxel downsample para unificar densidad
+    print("  [1/4] Voxel downsample...")
     merged_pcd = merged_pcd.voxel_down_sample(voxel_size=0.002)
-    merged_pcd, ind = merged_pcd.remove_statistical_outlier(nb_neighbors=30, std_ratio=1.5)
-    
+
+    # Fase 2: Primera pasada estadística amplia - elimina puntos muy alejados del grupo
+    print("  [2/4] Eliminando puntos aislados (pasada amplia)...")
+    merged_pcd, _ = merged_pcd.remove_statistical_outlier(nb_neighbors=20, std_ratio=2.0)
+
+    # Fase 3: Segunda pasada estadística fina - elimina el ruido fino restante
+    print("  [3/4] Apretando la limpieza (pasada fina)...")
+    merged_pcd, _ = merged_pcd.remove_statistical_outlier(nb_neighbors=30, std_ratio=1.2)
+
+    # Fase 4: Filtro de radio - elimina "nubes" de puntos flotantes sin vecinos cercanos
+    print("  [4/4] Eliminando puntos flotantes (radio filter)...")
+    merged_pcd, _ = merged_pcd.remove_radius_outlier(nb_points=10, radius=0.015)
+
+    print(f"  ✓ Nube limpia: {len(merged_pcd.points)} puntos finales.")
     return merged_pcd
 
 def main():
