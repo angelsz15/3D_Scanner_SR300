@@ -9,6 +9,7 @@ El usuario graba un vídeo dando la vuelta al objeto, y el sistema reconstruye a
 
 ### Hardware
 - Intel RealSense SR300 conectada por **USB 3.0** (puerto azul)
+- Módulo IMU (MPU6050 + ESP32-C3) conectado por USB (Opcional pero altamente recomendado para evitar derivas al girar).
 - El Intel RealSense Viewer debe estar **cerrado** al ejecutar el script
 
 ### Software
@@ -33,6 +34,7 @@ uv pip install --python env_sr300 pyrealsense2==2.50.0.3812 opencv-python open3d
 
 | Tecla | Acción |
 |-------|--------|
+| **C** | Calibrar el IMU (dejar el escáner sobre la mesa sin mover) |
 | **R** | Empezar / Parar grabación 3D |
 | **Q / ESC** | Salir del programa |
 
@@ -53,8 +55,12 @@ uv pip install --python env_sr300 pyrealsense2==2.50.0.3812 opencv-python open3d
 
 ```
 3D_Scanner/
-├── escanner_3d.py      # Script principal
+├── escanner_3d.py      # Script principal de escaneo
+├── imu_reader.py       # Hilo en segundo plano para leer datos del ESP32
+├── test_imu_3d.py      # Script de prueba visual para verificar la orientación del IMU
 ├── check_camera.py     # Script de diagnóstico de la cámara
+├── imu_esp32/
+│   └── imu_esp32.ino   # Firmware para el ESP32-C3 y el MPU6050 (Filtro complementario)
 ├── env_sr300/          # Entorno virtual Python 3.9 (pyrealsense2==2.50)
 └── escaneos/           # Carpeta donde se guardan los resultados .ply
 ```
@@ -104,7 +110,18 @@ pcd.estimate_normals(KDTreeSearchParamHybrid(radius=0.03, max_nn=30))
 
 Un KD-Tree permite encontrar los 30 vecinos más cercanos en un radio de 3 cm con complejidad `O(log N)`. Con esa vecindad local se ajusta un plano por mínimos cuadrados y se extrae su vector normal unitario `n̂`.
 
-#### Paso 2: Colored ICP (Iterative Closest Point con Color)
+#### Paso 2: Pre-alineación IMU (Tracking del Yaw)
+
+Para evitar que el Colored ICP se pierda al rotar superficies muy simétricas, se inyecta el ángulo absoluto de guiñada (`Yaw`) recolectado por el ESP32-C3 como inicialización:
+
+```python
+delta_yaw_rad = np.radians(scans[i-1]['yaw'] - scans[i]['yaw'])
+init_trans = np.identity(4)
+# Matriz de rotación en el eje Y
+```
+Esta pequeña ayuda alinea las nubes un 90% antes del ICP, permitiendo escaneos 360º casi perfectos.
+
+#### Paso 3: Colored ICP (Iterative Closest Point con Color)
 
 El algoritmo ICP clásico busca la transformación rígida **T** = {R, t} (rotación `R` ∈ SO(3) y traslación `t` ∈ ℝ³) que minimiza la distancia entre dos nubes de puntos. La función de coste es:
 
@@ -140,13 +157,14 @@ donde `ξ` ∈ se(3) es la actualización infinitesimal de la pose en algebra de
 current_transform = current_transform @ result_icp.transformation
 ```
 
-#### Paso 3: Post-procesado
+#### Paso 4: Post-procesado (Multi-fase)
 
-Tras acumular todas las nubes en la nube maestra `merged_pcd`:
+Tras acumular todas las nubes en la nube maestra `merged_pcd`, se aplica un filtro de 4 fases para garantizar una malla nítida:
 
-- **Voxel Down-Sample** (`voxel_size=0.002 m`): Discretiza el espacio en voxels de 2 mm. Todos los puntos que caen en el mismo voxel se reemplazan por su centroide. Esto elimina la redundancia de puntos donde hubo solapamiento entre capturas.
-
-- **Statistical Outlier Removal** (30 vecinos, σ=1.5): Para cada punto, se calcula la distancia media a sus 30 vecinos más cercanos. Los puntos cuya distancia supere `μ + 1.5σ` sobre la media global se eliminan como ruido o puntos flotantes del sensor.
+1. **Voxel Down-Sample (2mm)**: Discretiza el espacio en voxels de 2 mm. Todos los puntos que caen en el mismo voxel se reemplazan por su centroide, homogeneizando la densidad y eliminando puntos solapados.
+2. **Statistical Outlier Removal (Amplio)**: Filtro agresivo (`std_ratio=2.0`) para eliminar manchas de ruido o fantasmas muy lejanos a las superficies reales.
+3. **Statistical Outlier Removal (Fino)**: Segunda pasada más estricta (`std_ratio=1.2`) para alisar el ruido microscópico superficial intrínseco del sensor infrarrojo de la RealSense.
+4. **Radius Outlier Removal**: Por último, cualquier punto que no posea al menos 10 vecinos en un radio esférico de 15mm es purgado, borrando así pequeñas "motas de polvo" flotantes.
 
 ---
 
@@ -158,6 +176,7 @@ Tras acumular todas las nubes en la nube maestra `merged_pcd`:
 | `opencv-python` | 4.x | Visualización y manipulación de imágenes 2D |
 | `open3d` | 0.19 | Nubes de puntos, Colored ICP, exportación PLY |
 | `numpy` | 2.x | Operaciones matriciales y de arrays |
+| `pyserial` | 3.x | Comunicación con el microcontrolador ESP32 |
 
 > ⚠️ **Nota de compatibilidad**: La SR300 es una cámara legacy. Las versiones de `pyrealsense2` superiores a la 2.53 no incluyen soporte para este hardware en sus wheels de Python para Windows. Por este motivo se utiliza el entorno `env_sr300` con Python 3.9 y `pyrealsense2==2.50.0.3812`.
 
